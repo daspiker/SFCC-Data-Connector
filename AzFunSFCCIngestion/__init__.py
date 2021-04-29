@@ -2,7 +2,6 @@ import requests
 import datetime
 import dateutil
 import logging
-import boto3
 import gzip
 import io
 import csv
@@ -13,21 +12,22 @@ import json
 import hashlib
 import hmac
 import base64
+import pysftp
 from threading import Thread
 from io import StringIO
 
 import azure.functions as func
 
-
 sentinel_customer_id = os.environ.get('WorkspaceID')
 sentinel_shared_key = os.environ.get('WorkspaceKey')
-aws_access_key_id = os.environ.get('AWSAccessKeyId')
-aws_secret_acces_key = os.environ.get('AWSSecretAccessKey')
-aws_region_name = os.environ.get('AWSRegionName')
-aws_securityhub_filters = os.environ.get('SecurityHubFilters')
 sentinel_log_type = os.environ.get('LogAnalyticsCustomLogName')
-fresh_event_timestamp = os.environ.get('FreshEventTimeStamp')
 
+sfcc_sftp_username = os.environ.get('SfccSftpUsername')
+sfcc_sftp_password = os.environ.get('SfccSftpPassword')
+sfcc_sftp_filename = os.environ.get('SfccSftpFilename')
+sfcc_sftp_filepath = os.environ.get('SfccSftpFilepath')
+sfcc_sftp_host = os.environ.get('SfccSftpHost')
+sfcc_sftp_cnopts = os.environ.get('SfccSftpCnopts')
 
 def main(mytimer: func.TimerRequest) -> None:
     if mytimer.past_due:
@@ -35,110 +35,15 @@ def main(mytimer: func.TimerRequest) -> None:
 
     logging.info('Starting program')
     
-    sentinel = AzureSentinelConnector(sentinel_customer_id, sentinel_shared_key, sentinel_log_type, queue_size=10000, bulks_number=10)
-    securityHubSession = SecurityHubClient(aws_access_key_id, aws_secret_acces_key, aws_region_name)
-    securityhub_filters_dict = {}
-    logging.info ('SecurityHubFilters : {0}'.format(aws_securityhub_filters))
-    if aws_securityhub_filters:
-        securityhub_filters = aws_securityhub_filters.replace("\'", "\"") 
-        securityhub_filters_dict = eval(securityhub_filters)
-        
-    results = securityHubSession.getFindings(securityhub_filters_dict)
-    fresh_events_after_this_time = securityHubSession.freshEventTimestampGenerator(int(fresh_event_timestamp))
-    fresh_events = True
-    first_call = True
-    failed_sent_events_number = 0
-    successfull_sent_events_number = 0
-    
-    while ((first_call or 'NextToken' in results) and fresh_events):
-        # Loop through all findings (100 per page) returned by Security Hub API call		
-		# Break out of the loop when we have looked back across the last hour of events (based on the finding's LastObservedAt timestamp)
-        first_call = False
-        
-        for finding in results['Findings']:
-            finding_timestamp = securityHubSession.findingTimestampGenerator(finding['LastObservedAt'])
-                        
-            if (finding_timestamp > fresh_events_after_this_time):
-                logging.info ('SecurityHub Finding:{0}'.format(json.dumps(finding)))
-                payload = {}                
-                payload.update({'SchemaVersion':finding['SchemaVersion']})
-                payload.update({'Id':finding['Id']})
-                payload.update({'ProductArn':finding['ProductArn']})
-                payload.update({'GeneratorId':finding['GeneratorId']})
-                payload.update({'AwsAccountId':finding['AwsAccountId']})
-                payload.update({'Types':finding['Types']})
-                payload.update({'FirstObservedAt':finding['FirstObservedAt']})
-                payload.update({'LastObservedAt':finding['LastObservedAt']})
-                payload.update({'UpdatedAt':finding['UpdatedAt']})
-                payload.update({'Severity':json.dumps(finding['Severity'], sort_keys=True)})
-                payload.update({'Title':finding['Title']})                        
-                payload.update({'ProductFields':json.dumps(finding['ProductFields'], sort_keys=True)})
-                payload.update({'ProductArn':finding['ProductArn']})
-                payload.update({'CreatedAt':finding['CreatedAt']})            
-                payload.update({'Resources':finding['Resources']})            
-                payload.update({'WorkflowState':finding['WorkflowState']})                
-                payload.update({'RecordState':finding['RecordState']})
+    #get files via SFTP
+    with pysftp.Connection(sfcc_sftp_host, username=sfcc_sftp_username, password=sfcc_sftp_password, cnopts=sfcc_sftp_cnopts) as sftp:
+        sftp.cwd(sfcc_sftp_filepath)
+        sftp.get(sfcc_sftp_filename)
+
+    #sentinel = AzureSentinelConnector(sentinel_customer_id, sentinel_shared_key, sentinel_log_type, queue_size=10000, bulks_number=10)
                 
-                with sentinel:
-                    sentinel.send(payload)
-                    
-                failed_sent_events_number = sentinel.failed_sent_events_number
-                successfull_sent_events_number = sentinel.successfull_sent_events_number              
-            else:
-                fresh_events = False
-                break
-            
-        if (fresh_events and 'NextToken' in results):
-            results = securityHubSession.getFindingsWithToken(results['NextToken'], securityhub_filters_dict)
-    
-    if failed_sent_events_number:
-        logging.error('{} events have not been sent'.format(failed_sent_events_number))
-
-    if successfull_sent_events_number:
-        logging.info('Program finished. {} events have been sent. {} events have not been sent'.format(successfull_sent_events_number, failed_sent_events_number))
-
-    if successfull_sent_events_number == 0 and failed_sent_events_number == 0:
-        logging.info('No Fresh SecurityHub Events')
-
-
-class SecurityHubClient:
-    def __init__(self, aws_access_key_id, aws_secret_acces_key, aws_region_name):
-        self.aws_access_key_id = aws_access_key_id
-        self.aws_secret_acces_key = aws_secret_acces_key
-        self.aws_region_name = aws_region_name       
-
-        self.securityhub = boto3.client(
-            'securityhub',
-            aws_access_key_id=self.aws_access_key_id,
-            aws_secret_access_key=self.aws_secret_acces_key,
-            region_name=self.aws_region_name
-        )    
-
-    def freshEventTimestampGenerator(self, freshEventsDuration):
-        tm = datetime.datetime.utcfromtimestamp(time.time())
-        return time.mktime((tm - datetime.timedelta(minutes=freshEventsDuration)).timetuple())
-
-    # Gets the epoch time of a UTC timestamp in a Security Hub finding
-    def findingTimestampGenerator(self, finding_time):
-        d = dateutil.parser.parse(finding_time)
-        d.astimezone(dateutil.tz.tzutc())
-        return time.mktime(d.timetuple())
-
-    # Gets 100 most recent findings from securityhub
-    def getFindings(self, filters={}):
-        return self.securityhub.get_findings(
-            Filters=filters,
-            MaxResults=100,
-            SortCriteria=[{"Field": "LastObservedAt", "SortOrder": "desc"}])
-        
-    # Gets 100 findings from securityhub using the NextToken from a previous request
-    def getFindingsWithToken(self, token, filters={}):
-        return self.securityhub.get_findings(
-	        Filters=filters,
-	        NextToken=token,
-            MaxResults=100,
-            SortCriteria=[{"Field": "LastObservedAt", "SortOrder": "desc"}]
-	    )
+    #with sentinel:
+    #    sentinel.send(payload)
 
 
 class AzureSentinelConnector:
