@@ -36,15 +36,17 @@ def main(mytimer: func.TimerRequest) -> None:
     logging.info('Starting program')
     
     #get files via SFTP
-    with pysftp.Connection(sfcc_sftp_host, username=sfcc_sftp_username, password=sfcc_sftp_password, cnopts=sfcc_sftp_cnopts) as sftp:
+    with pysftp.Connection(sfcc_sftp_host, username=sfcc_sftp_username, password=sfcc_sftp_password, private_key=".ppk", cnopts=sfcc_sftp_cnopts) as sftp:
         sftp.cwd(sfcc_sftp_filepath)
-        sftp.get(sfcc_sftp_filename)
+        sftpFile = sftp.get(sfcc_sftp_filename)
 
-    #sentinel = AzureSentinelConnector(sentinel_customer_id, sentinel_shared_key, sentinel_log_type, queue_size=10000, bulks_number=10)
+    sentinel = AzureSentinelConnector(sentinel_customer_id, sentinel_shared_key, sentinel_log_type, queue_size=10000, bulks_number=10)
                 
-    #with sentinel:
-    #    sentinel.send(payload)
-
+    with open(sfcc_sftp_filename, "r") as read_file:
+        data = json.load(read_file)
+        for entry in data:
+            with sentinel:
+                sentinel.send(entry)   
 
 class AzureSentinelConnector:
     def __init__(self, customer_id, shared_key, log_type, queue_size=200, bulks_number=10, queue_size_bytes=25 * (2**20)):
@@ -109,6 +111,7 @@ class AzureSentinelConnector:
     def _post_data(self, customer_id, shared_key, body, log_type):
         events_number = len(body)
         body = json.dumps(body, sort_keys=True)
+        print(body)
         method = 'POST'
         content_type = 'application/json'
         resource = '/api/logs'
@@ -126,9 +129,11 @@ class AzureSentinelConnector:
 
         response = requests.post(uri, data=body, headers=headers)
         if (response.status_code >= 200 and response.status_code <= 299):            
+            print(response.status_code)
             self.successfull_sent_events_number += events_number
             self.failedToSend = False
         else:
+            print(response.status_code)
             logging.error("Error during sending events to Azure Sentinel. Response code: {}".format(response.status_code))
             self.failed_sent_events_number += events_number
             self.failedToSend = True
