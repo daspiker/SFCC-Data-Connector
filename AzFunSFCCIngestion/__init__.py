@@ -41,8 +41,8 @@ def main(mytimer: func.TimerRequest) -> None:
         sftpFile = sftp.get(sfcc_sftp_filename)
 
     sentinel = AzureSentinelConnector(sentinel_customer_id, sentinel_shared_key, sentinel_log_type, queue_size=10000, bulks_number=10)
-                
-    with open(sfcc_sftp_filename, "r") as read_file:
+
+    with open(sftpFile, "r") as read_file:
         data = json.load(read_file)
         for entry in data:
             with sentinel:
